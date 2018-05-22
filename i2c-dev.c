@@ -33,7 +33,24 @@ struct i2c_dev {
 	struct i2c_adapter *adap;
 	struct device *dev;
 };
+static int i2cdev_notifier_call(struct notifier_block *nb, unsigned long action,
+			 void *data)
+{
+	struct device *dev = data;
 
+	switch (action) {
+	case BUS_NOTIFY_ADD_DEVICE:
+		return i2cdev_attach_adapter(dev, NULL);
+	case BUS_NOTIFY_DEL_DEVICE:
+		return i2cdev_detach_adapter(dev, NULL);
+	}
+
+	return 0;
+}
+
+static struct notifier_block i2cdev_notifier = {
+	.notifier_call = i2cdev_notifier_call,
+};
 /* ------------------------------------------------------------------------- */
 
 /*
@@ -42,7 +59,35 @@ struct i2c_dev {
 
 static int __init i2c_dev_init(void)
 {
+	int res;
+	pr_info("i2c /dev entries driver\n");
+	
+	res = register_chrdev(I2C_MAJOR, "i2c", &i2cdev_fops);
+	if (res)
+		goto out;
+	i2c_dev_class = class_create(THIS_MODULE, "i2c-dev");
+	if (IS_ERR(i2c_dev_class)) {
+		res = PTR_ERR(i2c_dev_class);
+		goto out_unreg_chrdev;
+	}
+	/* Keep track of adapters which will be added or removed later */
+	res = bus_register_notifier(&i2c_bus_type, &i2cdev_notifier);
+	if (res)
+		goto out_unreg_class;
+	
+	/*In fact is to traverse the I2C bus on the klist_devices list, 
+          for each device, __process_new_driver.I2C scanning from Linux Kernel*/
+	/* Bind to already existing adapters right away */
+	i2c_for_each_dev(NULL, i2cdev_attach_adapter);
+
 	return 0;
+out_unreg_class:
+	class_destroy(i2c_dev_class);
+out_unreg_chrdev:
+	unregister_chrdev(I2C_MAJOR, "i2c");
+out:
+	pr_info("%s: Driver Initialisation failed\n", __FILE__);
+	return res;
 }
 
 static void  __exit i2c_dev_exit(void)
@@ -56,4 +101,3 @@ MODULE_LICENSE("GPL");
 
 module_init(i2c_dev_init);
 module_exit(i2c_dev_exit);
-

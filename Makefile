@@ -1,12 +1,14 @@
 obj-m := i2c-dev.o
+#obj-m := i2c-scan.o
 #CFLAGS_i2c-dev.o := -DDEBUG
 
-KDIR =  /home/elinux/linux-4.4.96
+KDIR =  /lib/modules/$(shell uname -r)/build
 
 PWD := $(shell pwd)
 
 default:
-	$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KDIR) SUBDIRS=$(PWD) modules
+	#$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KDIR) SUBDIRS=$(PWD) modules
+	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) modules
 
 clean:
 	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) clean
