@@ -9,6 +9,7 @@ PWD := $(shell pwd)
 default:
 	#$(MAKE) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) -C $(KDIR) SUBDIRS=$(PWD) modules
 	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) modules
+	$(CC) i2cdetect.c -o i2cdetect 
 
 clean:
 	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) clean

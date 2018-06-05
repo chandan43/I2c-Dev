@@ -15,6 +15,8 @@
 #include <linux/notifier.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/cdev.h>
+#include <linux/compat.h>
 
 /*
  * An i2c_dev represents an i2c_adapter ... an I2C or SMBus master, not a
@@ -34,6 +36,82 @@ struct i2c_dev {
 	struct device *dev;
 	struct cdev cdev;
 };
+
+#define I2C_M_DMA_SAFE	0x0200
+#define  I2C_RDWR_IOCTL_MAX_MSGS	42
+#define I2C_MINORS	MINORMASK
+static LIST_HEAD(i2c_dev_list);
+static DEFINE_SPINLOCK(i2c_dev_list_lock);
+
+static struct i2c_dev *i2c_dev_get_by_minor(unsigned index)
+{
+	struct i2c_dev *i2c_dev;
+
+	spin_lock(&i2c_dev_list_lock);
+	list_for_each_entry(i2c_dev, &i2c_dev_list, list) {
+		if (i2c_dev->adap->nr == index)
+			goto found;
+	}
+	i2c_dev = NULL;
+found:
+	spin_unlock(&i2c_dev_list_lock);
+	return i2c_dev;
+}
+
+/**
+ * list_add_tail - add a new entry
+ * @new: new entry to be added
+ * @head: list head to add it before
+ *
+ * Insert a new entry before the specified head.
+ * This is useful for implementing queues.
+ */
+static struct i2c_dev *get_free_i2c_dev(struct i2c_adapter *adap)
+{
+	struct i2c_dev *i2c_dev;
+
+	if (adap->nr >= I2C_MINORS) {
+		printk(KERN_ERR "i2c-dev: Out of device minors (%d)\n",
+		       adap->nr);
+		return ERR_PTR(-ENODEV);
+	}
+
+	i2c_dev = kzalloc(sizeof(*i2c_dev), GFP_KERNEL);
+	if (!i2c_dev)
+		return ERR_PTR(-ENOMEM);
+	i2c_dev->adap = adap;
+
+	spin_lock(&i2c_dev_list_lock);
+	list_add_tail(&i2c_dev->list, &i2c_dev_list);
+	spin_unlock(&i2c_dev_list_lock);
+	return i2c_dev;
+}
+
+static void put_i2c_dev(struct i2c_dev *i2c_dev)
+{
+	spin_lock(&i2c_dev_list_lock);
+	list_del(&i2c_dev->list);
+	spin_unlock(&i2c_dev_list_lock);
+	kfree(i2c_dev);
+}
+
+
+static ssize_t name_show(struct device *dev,
+			 struct device_attribute *attr, char *buf)
+{
+	struct i2c_dev *i2c_dev = i2c_dev_get_by_minor(MINOR(dev->devt));
+
+	if (!i2c_dev)
+		return -ENODEV;
+	return sprintf(buf, "%s\n", i2c_dev->adap->name);
+}
+static DEVICE_ATTR_RO(name);
+
+static struct attribute *i2c_attrs[] = {
+	&dev_attr_name.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(i2c);
 /* ------------------------------------------------------------------------- */
 
 /*
@@ -485,7 +563,7 @@ struct i2c_rdwr_ioctl_data32 {
  *
  * Returns zero on success, or -EFAULT on error.
  */
-long  compat_i2cdev_ioctl(struct file *, unsigned int cmd, unsigned long arg)
+long  compat_i2cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct i2c_client *client = file->private_data;
 	unsigned long funcs;
