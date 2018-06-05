@@ -34,27 +34,313 @@ struct i2c_dev {
 	struct device *dev;
 	struct cdev cdev;
 };
-#ifdef CONFIG_COMPAT
+/* ------------------------------------------------------------------------- */
 
-struct i2c_smbus_ioctl_data32 {
-	u8 read_write;
-	u8 command;
-	u32 size;
-	compat_caddr_t data; /* union i2c_smbus_data *data */
-};
+/*
+ * After opening an instance of this character special file, a file
+ * descriptor starts out associated only with an i2c_adapter (and bus).
+ *
+ * Using the I2C_RDWR ioctl(), you can then *immediately* issue i2c_msg
+ * traffic to any devices on the bus used by that adapter.  That's because
+ * the i2c_msg vectors embed all the addressing information they need, and
+ * are submitted directly to an i2c_adapter.  However, SMBus-only adapters
+ * don't support that interface.
+ *
+ * To use read()/write() system calls on that file descriptor, or to use
+ * SMBus interfaces (and work with SMBus-only hosts!), you must first issue
+ * an I2C_SLAVE (or I2C_SLAVE_FORCE) ioctl.  That configures an anonymous
+ * (never registered) i2c_client so it holds the addressing information
+ * needed by those system calls and by this SMBus interface.
+ */
 
-struct i2c_msg32 {
-	u16 addr;
-	u16 flags;
-	u16 len;
-	compat_caddr_t buf;
-};
+static ssize_t i2cdev_read(struct file *file, char __user *buf, size_t count,
+		loff_t *offset)
+{
+	char *tmp;
+	int ret;
 
-struct i2c_rdwr_ioctl_data32 {
-	compat_caddr_t msgs; /* struct i2c_msg __user *msgs */
-	u32 nmsgs;
-};
+	struct i2c_client *client = file->private_data;
 
+	if (count > 8192)
+		count = 8192;
+
+	tmp = kmalloc(count, GFP_KERNEL);
+	if (tmp == NULL)
+		return -ENOMEM;
+
+	pr_debug("i2c-dev: i2c-%d reading %zu bytes.\n",
+		iminor(file_inode(file)), count);
+
+	ret = i2c_master_recv(client, tmp, count);
+	if (ret >= 0)
+		ret = copy_to_user(buf, tmp, count) ? -EFAULT : ret;
+	kfree(tmp);
+	return ret;
+}
+
+
+static ssize_t i2cdev_write(struct file *file, const char __user *buf,
+		size_t count, loff_t *offset)
+{
+	int ret;
+	char *tmp;
+	struct i2c_client *client = file->private_data;
+
+	if (count > 8192)
+		count = 8192;
+
+	tmp = memdup_user(buf, count);
+	if (IS_ERR(tmp))
+		return PTR_ERR(tmp);
+
+	pr_debug("i2c-dev: i2c-%d writing %zu bytes.\n",
+		iminor(file_inode(file)), count);
+
+	ret = i2c_master_send(client, tmp, count);
+	kfree(tmp);
+	return ret;
+}
+
+static int i2cdev_check(struct device *dev, void *addrp)
+{
+	struct i2c_client *client = i2c_verify_client(dev);
+
+	if (!client || client->addr != *(unsigned int *)addrp)
+		return 0;
+
+	return dev->driver ? -EBUSY : 0;
+}
+
+/* walk up mux tree */
+static int i2cdev_check_mux_parents(struct i2c_adapter *adapter, int addr)
+{
+	struct i2c_adapter *parent = i2c_parent_is_i2c_adapter(adapter);
+	int result;
+
+	result = device_for_each_child(&adapter->dev, &addr, i2cdev_check);
+	if (!result && parent)
+		result = i2cdev_check_mux_parents(parent, addr);
+
+	return result;
+}
+
+
+/* recurse down mux tree */
+static int i2cdev_check_mux_children(struct device *dev, void *addrp)
+{
+	int result;
+
+	if (dev->type == &i2c_adapter_type)
+		result = device_for_each_child(dev, addrp,
+						i2cdev_check_mux_children);
+	else
+		result = i2cdev_check(dev, addrp);
+
+	return result;
+}
+
+/* This address checking function differs from the one in i2c-core
+   in that it considers an address with a registered device, but no
+   driver bound to it, as NOT busy. */
+static int i2cdev_check_addr(struct i2c_adapter *adapter, unsigned int addr)
+{
+	struct i2c_adapter *parent = i2c_parent_is_i2c_adapter(adapter);
+	int result = 0;
+
+	if (parent)
+		result = i2cdev_check_mux_parents(parent, addr);
+
+	if (!result)
+		result = device_for_each_child(&adapter->dev, &addr,
+						i2cdev_check_mux_children);
+
+	return result;
+}
+
+/**
+ * memdup_user - duplicate memory region from user space
+ *
+ * @src: source address in user space
+ * @len: number of bytes to copy
+ *
+ * Returns an ERR_PTR() on failure.  Result is physically
+ * contiguous, to be freed by kfree().
+ */
+/**
+ * i2c_transfer - execute a single or combined I2C message
+ * @adap: Handle to I2C bus
+ * @msgs: One or more messages to execute before STOP is issued to
+ *	terminate the operation; each message begins with a START.
+ * @num: Number of messages to be executed.
+ *
+ * Returns negative errno, else the number of messages executed.
+ *
+ * Note that there is no requirement that each message be sent to
+ * the same slave address, although that is the most common model.
+ */
+static noinline int i2cdev_ioctl_rdwr(struct i2c_client *client,
+		unsigned nmsgs, struct i2c_msg *msgs)
+{
+	u8 __user **data_ptrs;
+	int i, res;
+
+	data_ptrs = kmalloc(nmsgs * sizeof(u8 __user *), GFP_KERNEL);
+	if (data_ptrs == NULL) {
+		kfree(msgs);
+		return -ENOMEM;
+	}
+	
+	res = 0;
+	for (i = 0; i < nmsgs; i++) {
+		/* Limit the size of the message to a sane amount */
+		if (msgs[i].len > 8192) { 
+			res = -EINVAL;
+			break;
+		}
+
+		data_ptrs[i] = (u8 __user *)msgs[i].buf;
+		msgs[i].buf = memdup_user(data_ptrs[i], msgs[i].len);
+		if (IS_ERR(msgs[i].buf)) {
+			res = PTR_ERR(msgs[i].buf);
+			break;
+		}
+		/* memdup_user allocates with GFP_KERNEL, so DMA is ok */
+		msgs[i].flags |= I2C_M_DMA_SAFE;
+
+		/*
+		 * If the message length is received from the slave (similar
+		 * to SMBus block read), we must ensure that the buffer will
+		 * be large enough to cope with a message length of
+		 * I2C_SMBUS_BLOCK_MAX as this is the maximum underlying bus
+		 * drivers allow. The first byte in the buffer must be
+		 * pre-filled with the number of extra bytes, which must be
+		 * at least one to hold the message length, but can be
+		 * greater (for example to account for a checksum byte at
+		 * the end of the message.)
+		 */
+		if (msgs[i].flags & I2C_M_RECV_LEN) {
+			if (!(msgs[i].flags & I2C_M_RD) ||
+			    msgs[i].len < 1 || msgs[i].buf[0] < 1 ||
+			    msgs[i].len < msgs[i].buf[0] +
+					     I2C_SMBUS_BLOCK_MAX) {
+				res = -EINVAL;
+				break;
+			}
+
+			msgs[i].len = msgs[i].buf[0];
+		}
+	}
+	if (res < 0) {
+		int j;
+		for (j = 0; j < i; ++j)
+			kfree(msgs[j].buf);
+		kfree(data_ptrs);
+		kfree(msgs);
+		return res;
+	}
+
+	res = i2c_transfer(client->adapter, msgs, nmsgs);
+	while (i-- > 0) {
+		if (res >= 0 && (msgs[i].flags & I2C_M_RD)) {
+			if (copy_to_user(data_ptrs[i], msgs[i].buf,
+					 msgs[i].len))
+				res = -EFAULT;
+		}
+		kfree(msgs[i].buf);
+	}
+	kfree(data_ptrs);
+	kfree(msgs);
+	return res;		
+}
+/**
+ * i2c_smbus_xfer - execute smbus protocol operations
+ * @adapter: handle to i2c bus
+ * @addr: address of smbus slave on that bus
+ * @flags: i2c_client_* flags (usually zero or i2c_client_pec)
+ * @read_write: i2c_smbus_read or i2c_smbus_write
+ * @command: byte interpreted by slave, for protocols which use such bytes
+ * @protocol: smbus protocol operation to execute, such as i2c_smbus_proc_call
+ * @data: data to be read or written
+ *
+ * this executes an smbus protocol operation, and returns a negative
+ * errno code else zero on success.
+ */
+static noinline int i2cdev_ioctl_smbus(struct i2c_client *client,
+				u8 read_write, u8 command, u32 size,
+						union i2c_smbus_data __user *data)
+{
+	union i2c_smbus_data temp = {};
+	int datasize, res;
+	
+	if ((size != I2C_SMBUS_BYTE) &&
+	    (size != I2C_SMBUS_QUICK) &&
+	    (size != I2C_SMBUS_BYTE_DATA) &&
+	    (size != I2C_SMBUS_WORD_DATA) &&
+	    (size != I2C_SMBUS_PROC_CALL) &&
+	    (size != I2C_SMBUS_BLOCK_DATA) &&
+	    (size != I2C_SMBUS_I2C_BLOCK_BROKEN) &&
+	    (size != I2C_SMBUS_I2C_BLOCK_DATA) &&
+	    (size != I2C_SMBUS_BLOCK_PROC_CALL)) {
+		dev_dbg(&client->adapter->dev,
+			"size out of range (%x) in ioctl I2C_SMBUS.\n",
+			size);
+		return -EINVAL;
+	}
+	/* Note that I2C_SMBUS_READ and I2C_SMBUS_WRITE are 0 and 1,
+	   so the check is valid if size==I2C_SMBUS_QUICK too. */
+	if ((read_write != I2C_SMBUS_READ) &&
+	    (read_write != I2C_SMBUS_WRITE)) {
+		dev_dbg(&client->adapter->dev,
+			"read_write out of range (%x) in ioctl I2C_SMBUS.\n",
+			read_write);
+		return -EINVAL;
+	}
+
+	/* Note that command values are always valid! */
+	if ((size == I2C_SMBUS_QUICK) ||
+	    ((size == I2C_SMBUS_BYTE) &&
+	    (read_write == I2C_SMBUS_WRITE)))
+		/* These are special: we do not use data */
+		return i2c_smbus_xfer(client->adapter, client->addr,
+				      client->flags, read_write,
+				      command, size, NULL);
+	if (data == NULL) {
+		dev_dbg(&client->adapter->dev,
+			"data is NULL pointer in ioctl I2C_SMBUS.\n");
+		return -EINVAL;
+	}
+	if ((size == I2C_SMBUS_BYTE_DATA) ||
+	    (size == I2C_SMBUS_BYTE))
+		datasize = sizeof(data->byte);
+	else if ((size == I2C_SMBUS_WORD_DATA) ||
+		 (size == I2C_SMBUS_PROC_CALL))
+		datasize = sizeof(data->word);
+	else /* size == smbus block, i2c block, or block proc. call */
+		datasize = sizeof(data->block);
+	if ((size == I2C_SMBUS_PROC_CALL) ||
+	    (size == I2C_SMBUS_BLOCK_PROC_CALL) ||
+	    (size == I2C_SMBUS_I2C_BLOCK_DATA) ||
+	    (read_write == I2C_SMBUS_WRITE)) {
+		if (copy_from_user(&temp, data, datasize))
+			return -EFAULT;
+	}
+	if (size == I2C_SMBUS_I2C_BLOCK_BROKEN) {
+		/* Convert old I2C block commands to the new
+		   convention. This preserves binary compatibility. */
+		size = I2C_SMBUS_I2C_BLOCK_DATA;
+		if (read_write == I2C_SMBUS_READ)
+			temp.block[0] = I2C_SMBUS_BLOCK_MAX;
+	}	
+	res = i2c_smbus_xfer(client->adapter, client->addr, client->flags,
+	      read_write, command, size, &temp);
+	if (!res && ((size == I2C_SMBUS_PROC_CALL) ||
+		     (size == I2C_SMBUS_BLOCK_PROC_CALL) ||
+		     (read_write == I2C_SMBUS_READ))) {
+		if (copy_to_user(data, &temp, datasize))
+			return -EFAULT;
+	}
+	return res;
+}
 /**
  * memdup_user - duplicate memory region from user space
  *
@@ -154,6 +440,27 @@ static long i2cdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	}
 	return 0;		
 }
+
+#ifdef CONFIG_COMPAT
+
+struct i2c_smbus_ioctl_data32 {
+	u8 read_write;
+	u8 command;
+	u32 size;
+	compat_caddr_t data; /* union i2c_smbus_data *data */
+};
+
+struct i2c_msg32 {
+	u16 addr;
+	u16 flags;
+	u16 len;
+	compat_caddr_t buf;
+};
+
+struct i2c_rdwr_ioctl_data32 {
+	compat_caddr_t msgs; /* struct i2c_msg __user *msgs */
+	u32 nmsgs;
+};
 
 /*
   If this method exists, it will be called (without the BKL) whenever 
